@@ -23,7 +23,7 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: quay.io/opendatahub/guardrails-detector-huggingface-runtime:v0.3.0
+    value: quay.io/opendatahub/guardrails-detector-huggingface-runtime:latest
   - name: dockerfile
     value: Dockerfile.hf
   - name: path-context
