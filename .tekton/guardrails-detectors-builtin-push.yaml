@@ -25,9 +25,9 @@ spec:
   - name: output-image
     value: quay.io/redhat-user-workloads/open-data-hub-tenant/guardrails-detectors-builtin:{{revision}}
   - name: dockerfile
-    value: detectors/Dockerfile.builtIn
+    value: Dockerfile.builtIn
   - name: path-context
-    value: .
+    value: detectors
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while maintaining trust after pipeline customization.
