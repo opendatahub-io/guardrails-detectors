@@ -12,7 +12,7 @@ metadata:
   creationTimestamp: null
   labels:
     appstudio.openshift.io/application: opendatahub-builds
-    appstudio.openshift.io/component: odh-built-in-detectors-ci
+    appstudio.openshift.io/component: odh-built-in-detector-ci
     pipelines.appstudio.openshift.io/type: build
   name: odh-built-in-detectors-on-push
   namespace: open-data-hub-tenant
