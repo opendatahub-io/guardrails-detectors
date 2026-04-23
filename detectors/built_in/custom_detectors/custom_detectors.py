@@ -1,16 +1,8 @@
 """
-This is an example custom_detectors.py file. Here, you can define any arbitrary Python code as a
-Guardrail detector.
+This is an example custom_detectors.py file. Overwrite this file to define custom guardrailing
+logic!
 
-The following rules apply:
-1) Each function defined in this file (except for those starting with "_") will be registered as a detector
-2) Functions that accept a parameter "headers" will receive the inbound request headers as a parameter
-3) Functions may either return a boolean or a dict:
-    3a) Return values that evaluate to false (e.g., {}, "", None, etc) are treated as non-detections
-    3b) Boolean responses of "true" are considered a detection
-    3c) Dict response must be parseable as a ContentAnalysisResponse object (see example below)
-4) This code may not import "os", "subprocess", "sys", or "shutil" for security reasons
-5) This code may not call "eval", "exec", "open", "compile", or "input" for security reasons
+See [docs/custom_detectors.md](../../docs/custom_detectors.md) for more details.
 """
 
 # example boolean-returning function
@@ -21,7 +13,7 @@ def over_100_characters(text: str) -> bool:
 def contains_word(text: str) -> dict:
     detection = "apple" in text.lower()
     if detection:
-        detection_position = text.find("apple")
+        detection_position = text.lower().find("apple")
         return {
             "start":detection_position,  # start position of detection in text
             "end": detection_position+5, # end position of detection in text
@@ -39,3 +31,31 @@ def _this_function_will_not_be_exposed():
 def function_that_needs_headers(text: str, headers: dict) -> bool:
     return headers['magic-key'] != "123"
 
+def function_that_needs_kwargs(text: str, **kwargs: dict) -> bool:
+    return kwargs['magic-key'] != "123"
+
+# === CUSTOM METRICS =====
+import time
+from prometheus_client import Counter
+prompt_rejection_counter = Counter(
+    "system_prompt_rejections",
+    "Number of rejections by the system prompt",
+)
+@use_instruments(instruments=[prompt_rejection_counter])
+def has_metrics(text: str) -> bool:
+    if "sorry" in text:
+        prompt_rejection_counter.inc()
+    return False
+
+
+background_metric = Counter(
+    "background_metric",
+    "Runs some logic in the background without blocking the /detections call"
+)
+@use_instruments(instruments=[background_metric])
+@non_blocking(return_value=False)
+def background_function(text: str) -> bool:
+    time.sleep(.25)
+    if "sorry" in text:
+        background_metric.inc()
+    return False
