@@ -1,6 +1,6 @@
 [project]
 name = "guardrails-detectors"
-version = "0.3.0"
+dynamic = ["version"]
 requires-python = ">=3.11"
 description = "A collection of detectors for the FMS Guardrails Orchestrator"
 license = "Apache-2.0"
@@ -46,8 +46,12 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=80.9.0"]
+requires = ["setuptools>=80.9.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = []
+
+[tool.setuptools_scm]
+root = ".."
+version_scheme = "no-guess-dev"
