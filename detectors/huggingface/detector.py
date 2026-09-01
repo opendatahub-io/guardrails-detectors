@@ -1,4 +1,6 @@
 import os
+from dataclasses import dataclass
+from typing import Dict, FrozenSet, Optional, Union
 
 from detectors.common.instrumented_detector import InstrumentedDetector
 
@@ -9,6 +11,7 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
     AutoModelForCausalLM,
 )
 from detectors.common.app import logger
@@ -20,7 +23,62 @@ from detectors.common.scheme import (
 import gc
 
 
-def _parse_safe_labels_env():
+def _parse_threshold_env():
+    """Parse THRESHOLD env var. Returns float or 0.5 as default."""
+    raw = os.environ.get("THRESHOLD")
+    if raw is not None:
+        try:
+            val = float(raw)
+            if not (0.0 <= val <= 1.0):
+                logger.warning(f"THRESHOLD env var {val} is outside [0, 1]. Using anyway.")
+            logger.info(f"THRESHOLD env var: {val}")
+            return val
+        except ValueError:
+            logger.warning(f"Could not parse THRESHOLD env var: {raw}. Defaulting to 0.5.")
+    return 0.5
+
+
+def _parse_label_thresholds_env():
+    """Parse LABEL_THRESHOLDS env var. Returns dict mapping label names to float thresholds."""
+    raw = os.environ.get("LABEL_THRESHOLDS")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and all(
+                isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
+                for k, v in parsed.items()
+            ):
+                logger.info(f"LABEL_THRESHOLDS env var: {parsed}")
+                return parsed
+            else:
+                logger.warning(
+                    f"Invalid LABEL_THRESHOLDS structure: {parsed!r}. "
+                    "Expected dict of str -> numeric. Defaulting to empty."
+                )
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Could not parse LABEL_THRESHOLDS env var: {e}. Defaulting to empty.")
+    return {}
+
+
+def _parse_max_length_env():
+    """Parse MAX_LENGTH env var. Returns positive int or 512 as default."""
+    raw = os.environ.get("MAX_LENGTH")
+    if raw is not None:
+        try:
+            val = int(raw)
+            if val <= 0:
+                logger.warning(f"MAX_LENGTH must be positive, got {val}. Defaulting to 512.")
+                return 512
+            logger.info(f"MAX_LENGTH env var: {val}")
+            return val
+        except ValueError:
+            logger.warning(f"Could not parse MAX_LENGTH env var: {raw}. Defaulting to 512.")
+    return 512
+
+
+def _parse_safe_labels_env(default=None):
+    if default is None:
+        default = [0]
     if os.environ.get("SAFE_LABELS"):
         try:
             parsed = json.loads(os.environ.get("SAFE_LABELS"))
@@ -31,10 +89,19 @@ def _parse_safe_labels_env():
                 logger.info(f"SAFE_LABELS env var: {parsed}")
                 return parsed
         except Exception as e:
-            logger.warning(f"Could not parse SAFE_LABELS env var: {e}. Defaulting to [0].")
-            return [0]
-    logger.info("SAFE_LABELS env var not set: defaulting to [0].")
-    return [0]
+            logger.warning(f"Could not parse SAFE_LABELS env var: {e}. Defaulting to {default}.")
+            return default
+    logger.info(f"SAFE_LABELS env var not set: defaulting to {default}.")
+    return default
+
+
+@dataclass(frozen=True)
+class _ResolvedParams:
+    """Validated, immutable bundle of per-request detector parameters."""
+    threshold: float
+    label_thresholds: Dict[str, float]
+    safe_labels: FrozenSet[Union[str, int]]
+    max_length: int
 
 
 class Detector(InstrumentedDetector):
@@ -58,6 +125,9 @@ class Detector(InstrumentedDetector):
         self.cuda_device = None
         self.model_name = "unknown"
         self.safe_labels = _parse_safe_labels_env()
+        self.default_threshold = _parse_threshold_env()
+        self.default_label_thresholds = _parse_label_thresholds_env()
+        self.default_max_length = _parse_max_length_env()
 
         model_files_path = os.environ.get("MODEL_DIR")
         if not model_files_path:
@@ -66,6 +136,22 @@ class Detector(InstrumentedDetector):
         logger.info(f"Loading model from {model_files_path}")
 
         self.initialize_model(model_files_path)
+
+        # For token classifiers, re-parse with "O" as the default safe label
+        # rather than index 0, since "O" can appear at any index depending
+        if self.is_token_classifier:
+            self.safe_labels = _parse_safe_labels_env(default=["O"])
+
+        # Cache model max length for use in _resolve_params
+        self._model_max_length = self._get_model_max_length()
+
+        # Clamp env-level max_length to model's actual capacity
+        if self._model_max_length and self.default_max_length > self._model_max_length:
+            logger.warning(
+                f"MAX_LENGTH env ({self.default_max_length}) exceeds model maximum ({self._model_max_length}). Clamping."
+            )
+            self.default_max_length = self._model_max_length
+
         self.initialize_device()
 
     def initialize_model(self, model_files_path):
@@ -86,8 +172,15 @@ class Detector(InstrumentedDetector):
 
         if any("ForTokenClassification" in arch for arch in config.architectures):
             self.is_token_classifier = True
-            logger.error("Token classification models are not supported.")
-            raise ValueError("Token classification models are not supported.")
+            if not getattr(self.tokenizer, "is_fast", False):
+                raise ValueError(
+                    "Token classification requires a fast tokenizer for "
+                    "offset mapping support, but only a slow tokenizer is "
+                    "available for this model."
+                )
+            self.model = AutoModelForTokenClassification.from_pretrained(
+                model_files_path
+            )
         elif any("GraniteForCausalLM" in arch for arch in config.architectures):
             self.is_causal_lm = True
             self.model = AutoModelForCausalLM.from_pretrained(model_files_path)
@@ -239,17 +332,111 @@ class Detector(InstrumentedDetector):
             )
         return content_analyses
 
-    def process_sequence_classification(self, text, detector_params=None, threshold=None):
+    @staticmethod
+    def _is_numeric(value):
+        """Check if value is a real numeric type (excluding bool)."""
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @staticmethod
+    def _is_positive_int(value):
+        """Check if value is a positive int (excluding bool)."""
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    def _get_model_max_length(self):
+        """Return the model's real max length, or None if not meaningfully set."""
+        model_max = getattr(self.tokenizer, "model_max_length", None)
+        # Many tokenizers set model_max_length to a huge sentinel (e.g. int(1e30))
+        # when no real limit is configured — treat these as unbounded
+        if model_max and model_max < 1_000_000:
+            return model_max
+        return None
+
+    def _resolve_params(
+        self,
+        detector_params: Optional[Dict],
+        direct_threshold: Optional[float] = None,
+    ) -> "_ResolvedParams":
+        """Resolve all detector_params into a validated bundle."""
         detector_params = detector_params or {}
-        if threshold is None:
-            threshold = detector_params.get("threshold", 0.5)
-        # Merge safe_labels from env and request
-        request_safe_labels = set(detector_params.get("safe_labels", []))
-        all_safe_labels = set(self.safe_labels) | request_safe_labels
+
+        # --- threshold ---
+        if direct_threshold is not None and self._is_numeric(direct_threshold):
+            threshold = float(direct_threshold)
+            if not (0.0 <= threshold <= 1.0):
+                logger.warning(f"Direct threshold {threshold} is outside [0, 1]. Using anyway.")
+        elif direct_threshold is not None:
+            logger.warning(f"Invalid direct threshold: {direct_threshold!r}. Using default {self.default_threshold}.")
+            threshold = self.default_threshold
+        else:
+            raw_t = detector_params.get("threshold")
+            if raw_t is None:
+                threshold = self.default_threshold
+            elif self._is_numeric(raw_t):
+                threshold = float(raw_t)
+                if not (0.0 <= threshold <= 1.0):
+                    logger.warning(f"Threshold {threshold} in detector_params is outside [0, 1]. Using anyway.")
+            else:
+                logger.warning(f"Invalid threshold in detector_params: {raw_t!r}. Using default {self.default_threshold}.")
+                threshold = self.default_threshold
+
+        # --- label_thresholds ---
+        label_thresholds = dict(self.default_label_thresholds)
+        request_lt = detector_params.get("label_thresholds", {})
+        if not isinstance(request_lt, dict):
+            logger.warning(f"Invalid label_thresholds in detector_params: {request_lt!r}. Ignoring.")
+        else:
+            for k, v in request_lt.items():
+                if isinstance(k, str) and self._is_numeric(v):
+                    label_thresholds[k] = float(v)
+                else:
+                    logger.warning(f"Ignoring invalid label_threshold entry: {k!r}={v!r}.")
+
+        # --- safe_labels ---
+        raw_sl = detector_params.get("safe_labels", [])
+        if isinstance(raw_sl, (str, int)) and not isinstance(raw_sl, bool):
+            raw_sl = [raw_sl]
+        if not isinstance(raw_sl, list):
+            logger.warning(f"Invalid safe_labels in detector_params: {raw_sl!r}. Ignoring.")
+            safe_labels = frozenset(self.safe_labels)
+        else:
+            valid = []
+            for item in raw_sl:
+                if isinstance(item, (str, int)) and not isinstance(item, bool):
+                    valid.append(item)
+                else:
+                    logger.warning(f"Ignoring invalid safe_label entry: {item!r}.")
+            safe_labels = frozenset(self.safe_labels) | frozenset(valid)
+
+        # --- max_length ---
+        raw_ml = detector_params.get("max_length")
+        if raw_ml is None:
+            max_length = self.default_max_length
+        elif self._is_positive_int(raw_ml):
+            max_length = raw_ml
+        else:
+            logger.warning(f"Invalid max_length in detector_params: {raw_ml!r}. Using default {self.default_max_length}.")
+            max_length = self.default_max_length
+
+        model_max = self._model_max_length
+        if model_max and max_length > model_max:
+            logger.warning(
+                f"Requested max_length {max_length} exceeds model maximum {model_max}. Clamping to {model_max}."
+            )
+            max_length = model_max
+
+        return _ResolvedParams(
+            threshold=threshold,
+            label_thresholds=label_thresholds,
+            safe_labels=safe_labels,
+            max_length=max_length,
+        )
+
+    def process_sequence_classification(self, text, detector_params=None, threshold=None):
+        params = self._resolve_params(detector_params, direct_threshold=threshold)
         content_analyses = []
         tokenized = self.tokenizer(
             text,
-            max_length=512,
+            max_length=params.max_length,
             return_tensors="pt",
             truncation=True,
             padding=True,
@@ -262,11 +449,11 @@ class Detector(InstrumentedDetector):
             probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
             for idx, prob in enumerate(probabilities):
                 label = self.model.config.id2label[idx]
-                # Exclude by index or label name
+                effective_threshold = params.label_thresholds.get(label, params.threshold)
                 if (
-                        prob >= threshold
-                        and idx not in all_safe_labels
-                        and label not in all_safe_labels
+                        prob >= effective_threshold
+                        and idx not in params.safe_labels
+                        and label not in params.safe_labels
                 ):
                     detection_value = getattr(self.model.config, "problem_type", None)
                     content_analyses.append(
@@ -274,12 +461,102 @@ class Detector(InstrumentedDetector):
                             start=0,
                             end=len(text),
                             detection_type=label,
-                            score=prob,
+                            score=float(prob),
                             text=text,
                             evidences=[],
                             **({"detection": detection_value} if detection_value is not None else {})
                         )
                     )
+        return content_analyses
+
+    def process_token_classification(self, text, detector_params=None, threshold=None):
+        params = self._resolve_params(detector_params, direct_threshold=threshold)
+        content_analyses = []
+        tokenized = self.tokenizer(
+            text,
+            max_length=params.max_length,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            return_offsets_mapping=True,
+        )
+        # offset_mapping is not a model input — extract before sending to device
+        offset_mapping = tokenized.pop("offset_mapping")[0]
+        if self.cuda_device:
+            tokenized = tokenized.to(self.cuda_device)
+
+        with torch.no_grad():
+            logits = self.model(**tokenized).logits
+            probabilities = torch.softmax(logits, dim=2).detach().cpu().numpy()[0]
+
+            # Per token, pick the single highest-probability non-safe label
+            # above threshold. This avoids overlapping spans and preserves
+            # left-to-right ordering.
+            detected_tokens = []
+            for token_idx, token_probs in enumerate(probabilities):
+                char_start, char_end = offset_mapping[token_idx].tolist()
+                # Skip special tokens (e.g. [CLS], [SEP]) which have (0, 0) offsets
+                if char_start == 0 and char_end == 0:
+                    continue
+
+                best_label = None
+                best_prob = -1.0
+                for label_idx, prob in enumerate(token_probs):
+                    label = self.model.config.id2label[label_idx]
+                    prob = float(prob)
+                    effective_threshold = params.label_thresholds.get(label, params.threshold)
+                    if (
+                        prob >= effective_threshold
+                        and label_idx not in params.safe_labels
+                        and label not in params.safe_labels
+                        and prob > best_prob
+                    ):
+                        best_label = label
+                        best_prob = prob
+
+                if best_label is not None:
+                    detected_tokens.append({
+                        "token_idx": token_idx,
+                        "char_start": int(char_start),
+                        "char_end": int(char_end),
+                        "label": best_label,
+                        "prob": best_prob,
+                    })
+
+            # Group adjacent tokens with the same label into spans
+            spans = []
+            for token in detected_tokens:
+                if (
+                    spans
+                    and spans[-1]["label"] == token["label"]
+                    and token["token_idx"] == spans[-1]["last_token_idx"] + 1
+                ):
+                    spans[-1]["char_end"] = token["char_end"]
+                    spans[-1]["last_token_idx"] = token["token_idx"]
+                    spans[-1]["probs"].append(token["prob"])
+                else:
+                    spans.append({
+                        "char_start": token["char_start"],
+                        "char_end": token["char_end"],
+                        "label": token["label"],
+                        "last_token_idx": token["token_idx"],
+                        "probs": [token["prob"]],
+                    })
+
+            detection_value = getattr(self.model.config, "problem_type", None)
+            for span in spans:
+                score = sum(span["probs"]) / len(span["probs"])
+                content_analyses.append(
+                    ContentAnalysisResponse(
+                        start=span["char_start"],
+                        end=span["char_end"],
+                        detection_type=span["label"],
+                        score=score,
+                        text=text[span["char_start"]:span["char_end"]],
+                        evidences=[],
+                        **({"detection": detection_value} if detection_value is not None else {})
+                    )
+                )
         return content_analyses
 
     def run(self, input: ContentAnalysisHttpRequest) -> ContentsAnalysisResponse:
@@ -297,6 +574,10 @@ class Detector(InstrumentedDetector):
             for text in input.contents:
                 if self.is_causal_lm:
                     analyses = self.process_causal_lm(text)
+                elif self.is_token_classifier:
+                    analyses = self.process_token_classification(
+                        text, detector_params=getattr(input, "detector_params", None)
+                    )
                 elif self.is_sequence_classifier:
                     analyses = self.process_sequence_classification(
                         text, detector_params=getattr(input, "detector_params", None)
